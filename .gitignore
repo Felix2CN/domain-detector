@@ -1,0 +1,6 @@
+# 构建源数据（4MB，可重新下载生成）
+scripts/apnic_data.txt
+
+# 系统文件
+.DS_Store
+Thumbs.db

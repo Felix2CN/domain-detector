@@ -9,91 +9,93 @@
 </head>
 
 <body>
-  <!-- 顶部标题 -->
   <header class="header">
-    <div class="header-icon">🛡️</div>
+    <div class="header-icon">DNS</div>
     <div class="header-text">
       <h1>域名探测器</h1>
       <p>防火墙白名单分析工具 <span class="header-version" id="headerVersion"></span></p>
     </div>
   </header>
 
-  <!-- 标签页切换 -->
   <nav class="tabs">
-    <button class="tab active" data-tab="current">📍 当前页面</button>
-    <button class="tab" data-tab="manual">🔍 手动分析</button>
-    <button class="tab" data-tab="merged">📋 合并结果</button>
-    <button class="tab" data-tab="history">📜 历史记录</button>
+    <button class="tab active" data-tab="current">当前页面</button>
+    <button class="tab" data-tab="manual">手动分析</button>
+    <button class="tab" data-tab="merged">合并结果</button>
+    <button class="tab" data-tab="history">历史记录</button>
   </nav>
 
-  <!-- 当前页面面板 -->
   <section id="panel-current" class="panel active">
+    <div class="detection-control">
+      <div class="detection-label">
+        <span class="detection-title">全局流量探测</span>
+        <span class="detection-desc">开启后自动分析后续所有页面请求</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="detectionToggle">
+        <span class="slider round"></span>
+      </label>
+    </div>
     <div class="current-url" id="currentUrl">加载中...</div>
     <div class="results-container" id="currentResults">
       <div class="empty-state">
-        <div class="empty-icon">🌐</div>
-        <p>浏览网页后，点击扩展图标查看域名分析</p>
+        <div class="empty-icon">-</div>
+        <p>浏览网页后，点击扩展图标查看域名分析结果。</p>
       </div>
     </div>
   </section>
 
-  <!-- 手动分析面板 -->
   <section id="panel-manual" class="panel">
     <div class="input-area">
-      <textarea id="urlInput" placeholder="输入网址，每行一个&#10;例如：&#10;https://example.com&#10;https://another-site.org"
-        spellcheck="false"></textarea>
+      <textarea id="urlInput" placeholder="输入网址，每行一个&#10;例如：&#10;https://example.com&#10;https://another-site.org" spellcheck="false"></textarea>
       <button id="btnAnalyze" class="btn-analyze">
         <span class="btn-text">开始分析</span>
-        <span class="btn-loading" style="display:none">⏳ 分析中...</span>
+        <span class="btn-loading" style="display:none">分析中...</span>
       </button>
     </div>
     <div class="results-container" id="manualResults">
       <div class="empty-state">
-        <div class="empty-icon">📝</div>
-        <p>输入网址后点击"开始分析"</p>
+        <div class="empty-icon">-</div>
+        <p>输入网址后点击“开始分析”。</p>
       </div>
     </div>
   </section>
 
-  <!-- 合并结果面板 -->
   <section id="panel-merged" class="panel">
     <div class="results-container" id="mergedResults">
       <div class="empty-state">
-        <div class="empty-icon">📋</div>
-        <p>分析多个网站后，这里会显示去重合并的域名清单</p>
+        <div class="empty-icon">-</div>
+        <p>分析多个网站后，这里会显示去重后的域名列表。</p>
       </div>
     </div>
   </section>
 
-  <!-- 历史记录面板 -->
   <section id="panel-history" class="panel">
     <div class="history-toolbar">
       <span class="history-count" id="historyCount">0 条记录</span>
-      <button id="btnClearHistory" class="btn-clear-history" title="清空历史">🗑️ 清空</button>
+      <button id="btnClearHistory" class="btn-clear-history" title="清空历史">清空</button>
     </div>
     <div class="results-container" id="historyResults">
       <div class="empty-state">
-        <div class="empty-icon">📜</div>
-        <p>暂无历史记录<br>分析网站后会自动保存</p>
+        <div class="empty-icon">-</div>
+        <p>暂无历史记录。<br>分析网站后会自动保存。</p>
       </div>
     </div>
   </section>
 
-  <!-- 底部操作栏 -->
   <footer class="footer">
     <div class="stats" id="stats">
       <span class="stat-item">
         <span class="dot dot-red"></span>
-        非中国: <strong id="statNonChina">0</strong>
+        非中国 <strong id="statNonChina">0</strong>
       </span>
       <span class="stat-item">
         <span class="dot dot-green"></span>
-        中国: <strong id="statChina">0</strong>
+        中国 <strong id="statChina">0</strong>
       </span>
     </div>
     <div class="footer-actions">
       <button id="btnCopyNonChina" class="btn-copy" title="复制所有非中国域名">
-        📋 一键复制
+        一键复制
       </button>
       <button id="btnCopyAll" class="btn-copy-secondary" title="复制全部域名">
         全部
@@ -101,8 +103,7 @@
     </div>
   </footer>
 
-  <!-- 复制成功提示 -->
-  <div class="toast" id="toast">✅ 已复制到剪贴板</div>
+  <div class="toast" id="toast">已复制到剪贴板</div>
 
   <script src="popup.js"></script>
 </body>

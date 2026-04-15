@@ -1,28 +1,25 @@
 /**
- * 域名探测器 - Background Service Worker
- * 职责：监听网络请求、记录域名与 IP、判断归属地
+ * Domain Detector - Background Service Worker
  */
 
-// 导入中国 IP 数据
 importScripts('china_ip.js');
 
-// ============================================================
-// 数据存储（内存 + chrome.storage.session 持久化）
-// ============================================================
-
-// 结构: { [tabId]: { url, domains: { [rootDomain]: { subdomains, ips, isChina } } } }
 const tabData = {};
-
-// 手动分析的数据：{ [taskId]: { url, domains: {...}, status } }
 const manualTasks = {};
 
-// ============================================================
-// 工具函数
-// ============================================================
+const STORAGE_KEY = 'backgroundState';
+const runtimeTaskMeta = {};
+const dnsCache = {};
+const dnsPending = {};
 
-/**
- * 已知多段 TLD 后缀列表
- */
+const DNS_CACHE_TTL = 5 * 60 * 1000;
+const TASK_TIMEOUT_MS = 30 * 1000;
+const TASK_RESULT_RETENTION_MS = 60 * 1000;
+
+let stateLoadedPromise = null;
+let persistTimer = null;
+let isGlobalDetectionEnabled = false;
+
 const MULTI_PART_TLDS = new Set([
     'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
     'co.uk', 'org.uk', 'ac.uk', 'gov.uk',
@@ -50,33 +47,21 @@ const MULTI_PART_TLDS = new Set([
     'co.de'
 ]);
 
-/**
- * 提取根域名（一级域名 + TLD）
- * 例: fonts.googleapis.com → googleapis.com
- *     www.google.co.uk → google.co.uk
- */
 function getRootDomain(hostname) {
     if (!hostname) return '';
-    // 如果是 IP 地址，直接返回
     if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) return hostname;
 
     const parts = hostname.toLowerCase().split('.');
     if (parts.length <= 2) return hostname.toLowerCase();
 
-    // 检查是否匹配多段 TLD
     const lastTwo = parts.slice(-2).join('.');
     if (MULTI_PART_TLDS.has(lastTwo)) {
-        // 取最后三段
         return parts.slice(-3).join('.');
     }
 
-    // 默认取最后两段
     return parts.slice(-2).join('.');
 }
 
-/**
- * 从 URL 中提取 hostname
- */
 function getHostname(url) {
     try {
         return new URL(url).hostname;
@@ -85,36 +70,139 @@ function getHostname(url) {
     }
 }
 
-// ============================================================
-// DNS 解析（代理环境下获取真实 IP）
-// ============================================================
+function serializeDomains(domains) {
+    const serialized = {};
+    for (const [domain, info] of Object.entries(domains || {})) {
+        serialized[domain] = {
+            subdomains: Array.isArray(info.subdomains) ? [...info.subdomains] : [...(info.subdomains || [])],
+            ips: Array.isArray(info.ips) ? [...info.ips] : [...(info.ips || [])],
+            isChina: info.isChina !== false
+        };
+    }
+    return serialized;
+}
 
-const dnsCache = {}; // { hostname: { ip, timestamp } }
-const DNS_CACHE_TTL = 300000; // 5 分钟
+function hydrateDomains(domains) {
+    const hydrated = {};
+    for (const [domain, info] of Object.entries(domains || {})) {
+        hydrated[domain] = {
+            subdomains: new Set(info.subdomains || []),
+            ips: new Set(info.ips || []),
+            isChina: info.isChina !== false
+        };
+    }
+    return hydrated;
+}
 
-/**
- * 检测是否为代理/本地 IP
- */
+function snapshotState() {
+    const serializedTabs = {};
+    for (const [tabId, data] of Object.entries(tabData)) {
+        serializedTabs[tabId] = {
+            url: data.url,
+            startTime: data.startTime,
+            domains: serializeDomains(data.domains)
+        };
+    }
+
+    const serializedTasks = {};
+    for (const [taskId, task] of Object.entries(manualTasks)) {
+        serializedTasks[taskId] = {
+            ...task,
+            domains: task.domains || {}
+        };
+    }
+
+    return {
+        tabData: serializedTabs,
+        manualTasks: serializedTasks
+    };
+}
+
+function schedulePersistState() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(async () => {
+        persistTimer = null;
+        try {
+            await chrome.storage.session.set({ [STORAGE_KEY]: snapshotState() });
+        } catch (error) {
+            console.warn('Persist state failed:', error);
+        }
+    }, 200);
+}
+
+async function ensureStateLoaded() {
+    if (stateLoadedPromise) {
+        await stateLoadedPromise;
+        return;
+    }
+
+    stateLoadedPromise = (async () => {
+        try {
+            const local = await chrome.storage.local.get(['isGlobalDetectionEnabled']);
+            isGlobalDetectionEnabled = !!local.isGlobalDetectionEnabled;
+
+            const stored = await chrome.storage.session.get(STORAGE_KEY);
+            const state = stored[STORAGE_KEY];
+            if (!state) return;
+
+            for (const [tabId, data] of Object.entries(state.tabData || {})) {
+                tabData[tabId] = {
+                    url: data.url || '',
+                    startTime: data.startTime || Date.now(),
+                    domains: hydrateDomains(data.domains)
+                };
+            }
+
+            for (const [taskId, task] of Object.entries(state.manualTasks || {})) {
+                manualTasks[taskId] = {
+                    ...task,
+                    status: task.status === 'loading' ? 'interrupted' : task.status
+                };
+            }
+
+            pruneFinishedTasks();
+            schedulePersistState();
+        } catch (error) {
+            console.warn('Load state failed:', error);
+        }
+    })();
+
+    await stateLoadedPromise;
+}
+
+function ensureTabRecord(tabId, url = '') {
+    const key = String(tabId);
+    if (!tabData[key]) {
+        tabData[key] = {
+            url,
+            domains: {},
+            startTime: Date.now()
+        };
+    } else if (url) {
+        tabData[key].url = url;
+    }
+    return tabData[key];
+}
+
 function isProxyIP(ip) {
     if (!ip) return true;
     if (ip === '127.0.0.1' || ip === '0.0.0.0' || ip === '::1') return true;
     if (ip.startsWith('192.168.') || ip.startsWith('10.')) return true;
     if (ip.startsWith('172.')) {
-        const second = parseInt(ip.split('.')[1]);
+        const second = parseInt(ip.split('.')[1], 10);
         if (second >= 16 && second <= 31) return true;
     }
     return false;
 }
 
-/**
- * 通过 DNS-over-HTTPS 解析真实 IP
- * 优先 AliDNS，备选 Cloudflare
- */
 async function resolveRealIP(hostname) {
-    // 检查缓存
     const cached = dnsCache[hostname];
     if (cached && Date.now() - cached.timestamp < DNS_CACHE_TTL) {
         return cached.ip;
+    }
+
+    if (dnsPending[hostname]) {
+        return dnsPending[hostname];
     }
 
     const dohServers = [
@@ -122,52 +210,115 @@ async function resolveRealIP(hostname) {
         'https://cloudflare-dns.com/dns-query'
     ];
 
-    for (const server of dohServers) {
-        try {
-            const resp = await fetch(
-                `${server}?name=${encodeURIComponent(hostname)}&type=A`,
-                { headers: { 'Accept': 'application/dns-json' } }
-            );
-            const data = await resp.json();
-            if (data.Answer) {
-                const aRecord = data.Answer.find(a => a.type === 1);
-                if (aRecord) {
-                    dnsCache[hostname] = { ip: aRecord.data, timestamp: Date.now() };
-                    return aRecord.data;
+    dnsPending[hostname] = (async () => {
+        for (const server of dohServers) {
+            try {
+                const resp = await fetch(
+                    `${server}?name=${encodeURIComponent(hostname)}&type=A`,
+                    { headers: { Accept: 'application/dns-json' } }
+                );
+                const data = await resp.json();
+                if (data.Answer) {
+                    const aRecord = data.Answer.find((answer) => answer.type === 1);
+                    if (aRecord) {
+                        dnsCache[hostname] = { ip: aRecord.data, timestamp: Date.now() };
+                        return aRecord.data;
+                    }
                 }
+            } catch {
+                continue;
             }
-        } catch (e) {
-            continue;
         }
+        return null;
+    })();
+
+    try {
+        return await dnsPending[hostname];
+    } finally {
+        delete dnsPending[hostname];
     }
-    return null;
 }
 
-// ============================================================
-// 网络请求监听
-// ============================================================
+function cleanupTaskRuntime(taskId) {
+    const meta = runtimeTaskMeta[taskId];
+    if (!meta) return;
+
+    if (meta.listener) {
+        chrome.tabs.onUpdated.removeListener(meta.listener);
+    }
+    if (meta.completeTimer) clearTimeout(meta.completeTimer);
+    if (meta.timeoutTimer) clearTimeout(meta.timeoutTimer);
+    if (meta.cleanupTimer) clearTimeout(meta.cleanupTimer);
+
+    delete runtimeTaskMeta[taskId];
+}
+
+function scheduleTaskDeletion(taskId) {
+    const meta = runtimeTaskMeta[taskId] || {};
+    if (meta.cleanupTimer) clearTimeout(meta.cleanupTimer);
+    meta.cleanupTimer = setTimeout(() => {
+        cleanupTaskRuntime(taskId);
+        delete manualTasks[taskId];
+        schedulePersistState();
+    }, TASK_RESULT_RETENTION_MS);
+    runtimeTaskMeta[taskId] = meta;
+}
+
+function finalizeTask(taskId, status, tabIdOverride = null) {
+    const task = manualTasks[taskId];
+    if (!task || task.status !== 'loading') return;
+
+    const tabId = tabIdOverride ?? task.tabId;
+    const data = tabId != null ? tabData[String(tabId)] : null;
+    task.domains = data ? serializeDomains(data.domains) : (task.domains || {});
+    task.status = status;
+
+    cleanupTaskRuntime(taskId);
+
+    if (tabId != null) {
+        try {
+            chrome.tabs.remove(tabId);
+        } catch {
+            // Ignore tab removal failures.
+        }
+        delete tabData[String(tabId)];
+    }
+
+    scheduleTaskDeletion(taskId);
+    schedulePersistState();
+}
+
+function pruneFinishedTasks() {
+    for (const [taskId, task] of Object.entries(manualTasks)) {
+        if (task.status !== 'loading') {
+            scheduleTaskDeletion(taskId);
+        }
+    }
+}
 
 chrome.webRequest.onResponseStarted.addListener(
-    (details) => {
+    async (details) => {
+        await ensureStateLoaded();
+
         if (details.tabId < 0) return;
+
+        if (!isGlobalDetectionEnabled) {
+            let isManual = false;
+            for (const task of Object.values(manualTasks)) {
+                if (task.tabId === details.tabId) {
+                    isManual = true;
+                    break;
+                }
+            }
+            if (!isManual) return;
+        }
 
         const hostname = getHostname(details.url);
         if (!hostname) return;
 
         const rootDomain = getRootDomain(hostname);
+        const tab = ensureTabRecord(details.tabId);
 
-        // 初始化 tab 数据
-        if (!tabData[details.tabId]) {
-            tabData[details.tabId] = {
-                url: '',
-                domains: {},
-                startTime: Date.now()
-            };
-        }
-
-        const tab = tabData[details.tabId];
-
-        // 初始化该根域的记录（默认为中国，确认非中国后再修改）
         if (!tab.domains[rootDomain]) {
             tab.domains[rootDomain] = {
                 subdomains: new Set(),
@@ -180,210 +331,210 @@ chrome.webRequest.onResponseStarted.addListener(
         record.subdomains.add(hostname);
 
         if (!details.ip || isProxyIP(details.ip)) {
-            // 代理环境：通过 DoH 解析真实 IP
-            resolveRealIP(hostname).then(realIP => {
-                if (realIP) {
-                    record.ips.add(realIP);
-                    if (!isChineseIP(realIP)) {
-                        record.isChina = false;
+            resolveRealIP(hostname).then((realIP) => {
+                if (!realIP) return;
+
+                record.ips.add(realIP);
+                if (!isChineseIP(realIP)) {
+                    record.isChina = false;
+                }
+
+                for (const task of Object.values(manualTasks)) {
+                    if (task.tabId === details.tabId) {
+                        task.domains = serializeDomains(tab.domains);
                     }
                 }
+                schedulePersistState();
             });
         } else {
-            // 直连环境：直接使用请求 IP
             record.ips.add(details.ip);
             if (!isChineseIP(details.ip)) {
                 record.isChina = false;
             }
         }
 
-        // 同步更新手动任务（如果这个 tab 属于某个任务）
-        for (const taskId in manualTasks) {
-            if (manualTasks[taskId].tabId === details.tabId) {
-                manualTasks[taskId].domains = tab.domains;
+        for (const task of Object.values(manualTasks)) {
+            if (task.tabId === details.tabId) {
+                task.domains = serializeDomains(tab.domains);
             }
         }
+
+        schedulePersistState();
     },
     { urls: ['<all_urls>'] }
 );
 
-// 监听标签页导航，记录主 URL
-chrome.webNavigation?.onCommitted?.addListener((details) => {
-    if (details.frameId !== 0) return; // 只关注主框架
-    if (tabData[details.tabId]) {
-        tabData[details.tabId].url = details.url;
-    }
+chrome.webNavigation?.onCommitted?.addListener(async (details) => {
+    await ensureStateLoaded();
+    if (details.frameId !== 0) return;
+
+    const tab = tabData[String(details.tabId)];
+    if (!tab) return;
+
+    tab.url = details.url;
+    schedulePersistState();
 });
 
-// 标签页关闭时清理
-chrome.tabs.onRemoved.addListener((tabId) => {
-    // 不要清理正在手动分析的标签
-    const isManualTask = Object.values(manualTasks).some(t => t.tabId === tabId);
-    if (!isManualTask) {
-        delete tabData[tabId];
-    }
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+    await ensureStateLoaded();
+    if (!changeInfo.url || !tabData[String(tabId)]) return;
+
+    tabData[String(tabId)].url = changeInfo.url;
+    schedulePersistState();
 });
 
-// 标签页更新时记录 URL
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (changeInfo.url && tabData[tabId]) {
-        tabData[tabId].url = changeInfo.url;
-    }
-});
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+    await ensureStateLoaded();
 
-// ============================================================
-// 消息处理（与 Popup 通信）
-// ============================================================
+    for (const [taskId, task] of Object.entries(manualTasks)) {
+        if (task.tabId === tabId && task.status === 'loading') {
+            finalizeTask(taskId, 'interrupted', tabId);
+        }
+    }
+
+    delete tabData[String(tabId)];
+    schedulePersistState();
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    switch (msg.type) {
-        case 'getTabData': {
-            const data = tabData[msg.tabId];
-            if (!data) {
-                sendResponse({ url: '', domains: {} });
+    (async () => {
+        await ensureStateLoaded();
+
+        switch (msg.type) {
+            case 'getDetectionState': {
+                sendResponse({ enabled: isGlobalDetectionEnabled });
                 return;
             }
-            // 序列化 Set 为数组
-            const serialized = {};
-            for (const [domain, info] of Object.entries(data.domains)) {
-                serialized[domain] = {
-                    subdomains: [...info.subdomains],
-                    ips: [...info.ips],
-                    isChina: info.isChina
-                };
+
+            case 'setDetectionState': {
+                isGlobalDetectionEnabled = msg.enabled;
+                await chrome.storage.local.set({ isGlobalDetectionEnabled });
+                sendResponse({ ok: true });
+                return;
             }
-            sendResponse({ url: data.url, domains: serialized });
-            return;
-        }
 
-        case 'analyzeUrl': {
-            const taskId = 'task_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
-            manualTasks[taskId] = {
-                url: msg.url,
-                tabId: null,
-                domains: {},
-                status: 'loading'
-            };
-
-            // 在后台打开标签页
-            chrome.tabs.create({ url: msg.url, active: false }, (tab) => {
-                manualTasks[taskId].tabId = tab.id;
-
-                // 确保 tabData 初始化
-                if (!tabData[tab.id]) {
-                    tabData[tab.id] = { url: msg.url, domains: {}, startTime: Date.now() };
-                } else {
-                    tabData[tab.id].url = msg.url;
+            case 'getTabData': {
+                const data = tabData[String(msg.tabId)];
+                if (!data) {
+                    sendResponse({ url: '', domains: {} });
+                    return;
                 }
 
-                // 等待页面加载完成 + 额外时间收集异步资源
-                const waitTime = msg.waitTime || 8000;
-
-                chrome.tabs.onUpdated.addListener(function listener(tabId, changeInfo) {
-                    if (tabId === tab.id && changeInfo.status === 'complete') {
-                        chrome.tabs.onUpdated.removeListener(listener);
-
-                        // 额外等待异步资源加载
-                        setTimeout(() => {
-                            const data = tabData[tab.id];
-                            const serialized = {};
-                            if (data) {
-                                for (const [domain, info] of Object.entries(data.domains)) {
-                                    serialized[domain] = {
-                                        subdomains: [...info.subdomains],
-                                        ips: [...info.ips],
-                                        isChina: info.isChina
-                                    };
-                                }
-                            }
-                            manualTasks[taskId].domains = serialized;
-                            manualTasks[taskId].status = 'done';
-
-                            // 关闭后台标签
-                            chrome.tabs.remove(tab.id);
-                            delete tabData[tab.id];
-                        }, waitTime);
-                    }
+                sendResponse({
+                    url: data.url,
+                    domains: serializeDomains(data.domains)
                 });
-
-                // 超时保护（30秒）
-                setTimeout(() => {
-                    if (manualTasks[taskId] && manualTasks[taskId].status === 'loading') {
-                        const data = tabData[tab.id];
-                        const serialized = {};
-                        if (data) {
-                            for (const [domain, info] of Object.entries(data.domains)) {
-                                serialized[domain] = {
-                                    subdomains: [...info.subdomains],
-                                    ips: [...info.ips],
-                                    isChina: info.isChina
-                                };
-                            }
-                        }
-                        manualTasks[taskId].domains = serialized;
-                        manualTasks[taskId].status = 'timeout';
-                        try { chrome.tabs.remove(tab.id); } catch (e) { }
-                        delete tabData[tab.id];
-                    }
-                }, 30000);
-            });
-
-            sendResponse({ taskId });
-            return;
-        }
-
-        case 'getTaskStatus': {
-            const task = manualTasks[msg.taskId];
-            if (!task) {
-                sendResponse({ status: 'not_found' });
                 return;
             }
-            sendResponse({
-                url: task.url,
-                status: task.status,
-                domains: task.domains
-            });
-            return;
-        }
 
-        case 'clearManualTasks': {
-            for (const taskId in manualTasks) {
-                if (manualTasks[taskId].tabId) {
-                    try { chrome.tabs.remove(manualTasks[taskId].tabId); } catch (e) { }
-                }
-                delete manualTasks[taskId];
-            }
-            sendResponse({ ok: true });
-            return;
-        }
+            case 'analyzeUrl': {
+                pruneFinishedTasks();
 
-        case 'clearTabData': {
-            delete tabData[msg.tabId];
-            sendResponse({ ok: true });
-            return;
-        }
+                const taskId = `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+                manualTasks[taskId] = {
+                    url: msg.url,
+                    tabId: null,
+                    domains: {},
+                    status: 'loading'
+                };
+                schedulePersistState();
 
-        case 'cancelTask': {
-            const task = manualTasks[msg.taskId];
-            if (task && task.status === 'loading') {
-                const data = tabData[task.tabId];
-                const serialized = {};
-                if (data) {
-                    for (const [domain, info] of Object.entries(data.domains)) {
-                        serialized[domain] = {
-                            subdomains: [...info.subdomains],
-                            ips: [...info.ips],
-                            isChina: info.isChina
-                        };
+                chrome.tabs.create({ url: msg.url, active: false }, (tab) => {
+                    if (chrome.runtime.lastError || !tab?.id || !manualTasks[taskId]) {
+                        finalizeTask(taskId, 'interrupted');
+                        sendResponse({ taskId });
+                        return;
                     }
-                }
-                task.domains = serialized;
-                task.status = 'done';
-                try { chrome.tabs.remove(task.tabId); } catch (e) { }
-                delete tabData[task.tabId];
+
+                    manualTasks[taskId].tabId = tab.id;
+                    ensureTabRecord(tab.id, msg.url);
+
+                    const waitTime = Number(msg.waitTime) || 8000;
+                    const listener = (updatedTabId, changeInfo) => {
+                        if (updatedTabId !== tab.id || changeInfo.status !== 'complete') return;
+
+                        chrome.tabs.onUpdated.removeListener(listener);
+                        if (!runtimeTaskMeta[taskId]) return;
+
+                        runtimeTaskMeta[taskId].listener = null;
+                        runtimeTaskMeta[taskId].completeTimer = setTimeout(() => {
+                            finalizeTask(taskId, 'done', tab.id);
+                        }, waitTime);
+                    };
+
+                    runtimeTaskMeta[taskId] = {
+                        listener,
+                        completeTimer: null,
+                        timeoutTimer: setTimeout(() => {
+                            finalizeTask(taskId, 'timeout', tab.id);
+                        }, TASK_TIMEOUT_MS),
+                        cleanupTimer: null
+                    };
+
+                    chrome.tabs.onUpdated.addListener(listener);
+                    schedulePersistState();
+                    sendResponse({ taskId });
+                });
+                return;
             }
-            sendResponse({ ok: true });
-            return;
+
+            case 'getTaskStatus': {
+                const task = manualTasks[msg.taskId];
+                if (!task) {
+                    sendResponse({ status: 'not_found' });
+                    return;
+                }
+
+                sendResponse({
+                    url: task.url,
+                    status: task.status,
+                    domains: task.domains || {}
+                });
+                return;
+            }
+
+            case 'clearManualTasks': {
+                for (const [taskId, task] of Object.entries(manualTasks)) {
+                    if (task.tabId != null) {
+                        try {
+                            chrome.tabs.remove(task.tabId);
+                        } catch {
+                            // Ignore tab removal failures.
+                        }
+                    }
+                    cleanupTaskRuntime(taskId);
+                    delete manualTasks[taskId];
+                }
+
+                schedulePersistState();
+                sendResponse({ ok: true });
+                return;
+            }
+
+            case 'clearTabData': {
+                delete tabData[String(msg.tabId)];
+                schedulePersistState();
+                sendResponse({ ok: true });
+                return;
+            }
+
+            case 'cancelTask': {
+                if (manualTasks[msg.taskId]) {
+                    finalizeTask(msg.taskId, 'cancelled');
+                }
+                sendResponse({ ok: true });
+                return;
+            }
+
+            default:
+                sendResponse({ error: 'unknown_message_type' });
         }
-    }
+    })().catch((error) => {
+        console.error('Message handling failed:', error);
+        sendResponse({ error: error.message });
+    });
+
+    return true;
 });
+
+ensureStateLoaded();

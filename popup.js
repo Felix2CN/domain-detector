@@ -1,20 +1,18 @@
 /**
- * 域名探测器 - Popup 逻辑
- * 职责：UI 交互、数据展示、复制功能
+ * Domain Detector - Popup Logic
  */
 
-// ============================================================
-// 全局状态
-// ============================================================
+const MAX_CONCURRENT_ANALYSIS = 3;
+const MAX_POLLS = 40;
+const MAX_HISTORY = 50;
 
-let currentFilter = 'all'; // 'all' | 'foreign' | 'china'
-let allResults = {}; // { source: url, domains: {} } 的集合
+let currentFilter = 'all';
+let allResults = {};
 let activeTab = 'current';
-let manualTaskIds = []; // 手动分析的任务 ID
-
-// ============================================================
-// DOM 元素
-// ============================================================
+let manualTaskIds = [];
+let pendingQueue = [];
+let runningTasks = 0;
+const completedManualTasks = new Set();
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -25,6 +23,7 @@ const elManualResults = $('#manualResults');
 const elMergedResults = $('#mergedResults');
 const elUrlInput = $('#urlInput');
 const elBtnAnalyze = $('#btnAnalyze');
+const elDetectionToggle = $('#detectionToggle');
 const elStatNonChina = $('#statNonChina');
 const elStatChina = $('#statChina');
 const elBtnCopyNonChina = $('#btnCopyNonChina');
@@ -34,286 +33,125 @@ const elHistoryResults = $('#historyResults');
 const elHistoryCount = $('#historyCount');
 const elBtnClearHistory = $('#btnClearHistory');
 
-// ============================================================
-// 标签页切换
-// ============================================================
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
 
-$$('.tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-        $$('.tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        activeTab = tab.dataset.tab;
+function normalizeDomainInfo(info = {}) {
+    return {
+        isChina: info.isChina !== false,
+        ips: Array.isArray(info.ips) ? info.ips : [...(info.ips || [])],
+        subdomains: Array.isArray(info.subdomains) ? info.subdomains : [...(info.subdomains || [])]
+    };
+}
 
-        $$('.panel').forEach(p => p.classList.remove('active'));
-        $(`#panel-${activeTab}`).classList.add('active');
+function buildMergedDomains() {
+    const merged = {};
 
-        if (activeTab === 'merged') {
-            renderMergedResults();
-        } else if (activeTab === 'history') {
-            renderHistory();
+    for (const result of Object.values(allResults)) {
+        let sourceHost = '';
+        try {
+            sourceHost = new URL(result.source).hostname;
+        } catch {
+            sourceHost = result.source || '';
         }
-    });
-});
 
-// ============================================================
-// 初始化：加载当前标签页数据
-// ============================================================
+        for (const [rootDomain, rawInfo] of Object.entries(result.domains || {})) {
+            const info = normalizeDomainInfo(rawInfo);
+            if (!merged[rootDomain]) {
+                merged[rootDomain] = {
+                    isChina: info.isChina,
+                    ips: new Set(info.ips),
+                    subdomains: new Set(info.subdomains),
+                    sources: new Set(sourceHost ? [sourceHost] : [])
+                };
+                continue;
+            }
 
-async function init() {
-    // 显示版本号
-    const manifest = chrome.runtime.getManifest();
-    $('#headerVersion').textContent = `v${manifest.version}`;
+            if (!info.isChina) merged[rootDomain].isChina = false;
+            info.ips.forEach((ip) => merged[rootDomain].ips.add(ip));
+            info.subdomains.forEach((subdomain) => merged[rootDomain].subdomains.add(subdomain));
+            if (sourceHost) merged[rootDomain].sources.add(sourceHost);
+        }
+    }
+
+    return merged;
+}
+
+function updateStats() {
+    const merged = buildMergedDomains();
+    const values = Object.values(merged);
+    elStatNonChina.textContent = values.filter((value) => !value.isChina).length;
+    elStatChina.textContent = values.filter((value) => value.isChina).length;
+}
+
+function collectDomains(chinaFilter) {
+    const merged = buildMergedDomains();
+    return Object.entries(merged)
+        .filter(([, value]) => chinaFilter === null || value.isChina === chinaFilter)
+        .map(([domain]) => `*.${domain}`)
+        .sort()
+        .join('\n');
+}
+
+async function copyToClipboard(text) {
+    if (!text) {
+        showToast('No domains to copy');
+        return;
+    }
 
     try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tab) {
-            elCurrentUrl.textContent = '未找到活动标签页';
-            return;
-        }
-
-        elCurrentUrl.textContent = `📍 ${tab.url || '无法获取URL'}`;
-
-        // 请求 background 获取该标签页数据
-        chrome.runtime.sendMessage(
-            { type: 'getTabData', tabId: tab.id },
-            (response) => {
-                if (response && Object.keys(response.domains).length > 0) {
-                    allResults['__current__'] = {
-                        source: tab.url,
-                        domains: response.domains
-                    };
-                    renderSiteGroup(elCurrentResults, tab.url, response.domains);
-                    updateStats();
-                    // 自动保存到历史
-                    saveToHistory(tab.url, response.domains);
-                } else {
-                    elCurrentResults.innerHTML = `
-            <div class="empty-state">
-              <div class="empty-icon">🌐</div>
-              <p>当前页面暂无网络请求数据<br>请刷新页面后重试</p>
-            </div>
-          `;
-                }
-            }
-        );
-    } catch (err) {
-        elCurrentUrl.textContent = `错误: ${err.message}`;
+        await navigator.clipboard.writeText(text);
+    } catch {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
     }
+
+    showToast(`Copied ${text.split('\n').length} domain(s)`);
 }
 
-// ============================================================
-// 手动分析
-// ============================================================
-
-elBtnAnalyze.addEventListener('click', async () => {
-    const input = elUrlInput.value.trim();
-    if (!input) return;
-
-    const urls = input.split('\n')
-        .map(u => u.trim())
-        .filter(u => u.length > 0)
-        .filter(u => {
-            // 智能过滤：只保留看起来像 URL 的行
-            // 1. 以 http:// 或 https:// 开头 → 明确是 URL
-            if (/^https?:\/\//i.test(u)) return true;
-            // 2. 像裸域名：包含点号、无空格、不全是数字/日期
-            if (u.includes('.') && !u.includes(' ') && !/^\d+[\/\-]/.test(u)) return true;
-            // 其他都过滤掉（人名、时间戳、聊天消息等）
-            return false;
-        })
-        .map(u => {
-            // 自动补全协议
-            if (!u.startsWith('http://') && !u.startsWith('https://')) {
-                return 'https://' + u;
-            }
-            return u;
-        });
-
-    if (urls.length === 0) return;
-
-    // 禁用按钮
-    elBtnAnalyze.disabled = true;
-    elBtnAnalyze.querySelector('.btn-text').style.display = 'none';
-    elBtnAnalyze.querySelector('.btn-loading').style.display = 'inline';
-
-    // 清空之前的手动结果
-    elManualResults.innerHTML = '';
-    manualTaskIds = [];
-
-    // 为每个 URL 创建加载状态
-    for (const url of urls) {
-        const loadingEl = createLoadingElement(url);
-        elManualResults.appendChild(loadingEl);
-
-        chrome.runtime.sendMessage(
-            { type: 'analyzeUrl', url: url, waitTime: 6000 },
-            (response) => {
-                if (response && response.taskId) {
-                    manualTaskIds.push({ taskId: response.taskId, url, loadingEl });
-                    loadingEl._taskId = response.taskId;
-                    pollTask(response.taskId, url, loadingEl);
-                }
-            }
-        );
-    }
-});
-
-/**
- * 轮询任务状态
- */
-function pollTask(taskId, url, loadingEl) {
-    let pollCount = 0;
-    const MAX_POLLS = 40; // 最多轮询 40 次（约 42 秒），防止无限轮询
-
-    const finishTask = (domains) => {
-        // 清除倒计时
-        if (loadingEl._countdownInterval) {
-            clearInterval(loadingEl._countdownInterval);
-        }
-        // 移除加载状态
-        loadingEl.remove();
-
-        // 存储结果
-        allResults[taskId] = {
-            source: url,
-            domains: domains || {}
-        };
-
-        // 渲染结果
-        renderSiteGroup(elManualResults, url, domains || {});
-
-        // 自动保存到历史
-        saveToHistory(url, domains);
-
-        // 检查是否所有任务都完成
-        checkAllTasksDone();
-        updateStats();
-    };
-
-    const poll = () => {
-        pollCount++;
-
-        // 安全阀：超过最大轮询次数，强制完成
-        if (pollCount > MAX_POLLS) {
-            finishTask({});
-            return;
-        }
-
-        chrome.runtime.sendMessage(
-            { type: 'getTaskStatus', taskId },
-            (response) => {
-                // Service Worker 重启或通信失败
-                if (!response || response.status === 'not_found') {
-                    finishTask({});
-                    return;
-                }
-
-                if (response.status === 'done' || response.status === 'timeout') {
-                    finishTask(response.domains);
-                } else {
-                    // 继续轮询
-                    setTimeout(poll, 1000);
-                }
-            }
-        );
-    };
-
-    setTimeout(poll, 2000);
+function showToast(msg) {
+    elToast.textContent = msg;
+    elToast.classList.add('show');
+    setTimeout(() => elToast.classList.remove('show'), 2000);
 }
 
-function checkAllTasksDone() {
-    const allDone = manualTaskIds.every(t => {
-        return allResults[t.taskId] !== undefined;
-    });
-
-    if (allDone && manualTaskIds.length > 0) {
-        elBtnAnalyze.disabled = false;
-        elBtnAnalyze.querySelector('.btn-text').style.display = 'inline';
-        elBtnAnalyze.querySelector('.btn-loading').style.display = 'none';
-    }
-}
-
-function createLoadingElement(url) {
-    const el = document.createElement('div');
-    el.className = 'task-loading';
-    el._taskId = null;
-    el.innerHTML = `
-    <div class="task-loading-top">
-      <div class="spinner"></div>
-      <span class="task-url">${escapeHtml(url)}</span>
-      <span class="task-countdown">30s</span>
-      <button class="task-skip" title="跳过此URL">跳过</button>
-    </div>
-    <div class="task-progress-bar">
-      <div class="task-progress-fill"></div>
-    </div>
-  `;
-
-    // 倒计时
-    let remaining = 30;
-    const countdownEl = el.querySelector('.task-countdown');
-    const progressFill = el.querySelector('.task-progress-fill');
-    const countdownInterval = setInterval(() => {
-        remaining--;
-        if (remaining <= 0) {
-            countdownEl.textContent = '即将完成';
-            clearInterval(countdownInterval);
-        } else {
-            countdownEl.textContent = `${remaining}s`;
-        }
-        progressFill.style.width = `${((30 - remaining) / 30) * 100}%`;
-    }, 1000);
-    el._countdownInterval = countdownInterval;
-
-    // 跳过按钮
-    const skipBtn = el.querySelector('.task-skip');
-    skipBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (el._taskId) {
-            chrome.runtime.sendMessage({ type: 'cancelTask', taskId: el._taskId });
-        }
-    });
-
-    return el;
-}
-
-// ============================================================
-// 渲染
-// ============================================================
-
-/**
- * 创建单个域名条目（带复制按钮）
- */
-function createDomainItem(rootDomain, info) {
+function createDomainItem(rootDomain, rawInfo) {
+    const info = normalizeDomainInfo(rawInfo);
     const item = document.createElement('div');
     item.className = 'domain-item';
 
     const tagClass = info.isChina ? 'tag-china' : 'tag-foreign';
-    const tagText = info.isChina ? '中国' : '非中国';
-    const ips = info.ips || [];
-    const ipDisplay = Array.isArray(ips) ? (ips[0] || '') : ([...ips][0] || '');
-    const ipTitle = Array.isArray(ips) ? ips.join(', ') : [...ips].join(', ');
-    const subdomains = info.subdomains || [];
-    const subTitle = Array.isArray(subdomains) ? subdomains.join(', ') : [...subdomains].join(', ');
+    const tagText = info.isChina ? 'CN' : 'Non-CN';
+    const ipDisplay = info.ips[0] || '';
+    const ipTitle = info.ips.join(', ');
+    const subTitle = info.subdomains.join(', ');
 
     item.innerHTML = `
       <span class="domain-name" title="${escapeHtml(subTitle || rootDomain)}">*.${escapeHtml(rootDomain)}</span>
       <span class="domain-tag ${tagClass}">${tagText}</span>
       <span class="domain-ip" title="${escapeHtml(ipTitle)}">${escapeHtml(ipDisplay)}</span>
-      <button class="domain-copy" title="复制">📋</button>
+      <button class="domain-copy" title="Copy">Copy</button>
     `;
 
-    // 复制按钮
-    const copyBtn = item.querySelector('.domain-copy');
-    copyBtn.addEventListener('click', (e) => {
+    item.querySelector('.domain-copy').addEventListener('click', (e) => {
         e.stopPropagation();
         copyToClipboard(`*.${rootDomain}`);
     });
 
     return item;
 }
+
 function renderSiteGroup(container, sourceUrl, domains) {
-    // 清除空状态
     const emptyState = container.querySelector('.empty-state');
     if (emptyState) emptyState.remove();
 
@@ -324,21 +162,19 @@ function renderSiteGroup(container, sourceUrl, domains) {
         hostname = sourceUrl;
     }
 
-    const domainEntries = Object.entries(domains);
-    const nonChinaCount = domainEntries.filter(([, v]) => !v.isChina).length;
+    const domainEntries = Object.entries(domains || {});
+    const nonChinaCount = domainEntries.filter(([, value]) => value.isChina === false).length;
 
     const group = document.createElement('div');
     group.className = 'site-group';
 
-    // 头部
     const header = document.createElement('div');
     header.className = 'site-header';
     header.innerHTML = `
-    <span class="site-name">📍 ${escapeHtml(hostname)}</span>
-    <span class="site-badge">${domainEntries.length} 个域名 · ${nonChinaCount} 个非中国</span>
-  `;
+      <span class="site-name">${escapeHtml(hostname)}</span>
+      <span class="site-badge">${domainEntries.length} domains / ${nonChinaCount} non-CN</span>
+    `;
 
-    // 折叠切换
     const body = document.createElement('div');
     body.className = 'site-body';
 
@@ -346,7 +182,6 @@ function renderSiteGroup(container, sourceUrl, domains) {
         body.classList.toggle('collapsed');
     });
 
-    // 排序：非中国排前面
     const sorted = domainEntries.sort((a, b) => {
         if (a[1].isChina === b[1].isChina) return a[0].localeCompare(b[0]);
         return a[1].isChina ? 1 : -1;
@@ -359,81 +194,49 @@ function renderSiteGroup(container, sourceUrl, domains) {
     group.appendChild(header);
     group.appendChild(body);
     container.appendChild(group);
-
     return group;
 }
 
-/**
- * 渲染合并结果
- */
 function renderMergedResults() {
     elMergedResults.innerHTML = '';
 
-    if (Object.keys(allResults).length === 0) {
+    const merged = buildMergedDomains();
+    if (Object.keys(merged).length === 0) {
         elMergedResults.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">📋</div>
-        <p>暂无分析结果</p>
-      </div>
-    `;
+          <div class="empty-state">
+            <div class="empty-icon">-</div>
+            <p>No merged results yet</p>
+          </div>
+        `;
         return;
     }
 
-    // 合并所有域名
-    const merged = {}; // { rootDomain: { isChina, ips: Set, subdomains: Set, sources: Set } }
-
-    for (const [key, result] of Object.entries(allResults)) {
-        let sourceHost = '';
-        try {
-            sourceHost = new URL(result.source).hostname;
-        } catch {
-            sourceHost = result.source;
-        }
-
-        for (const [rootDomain, info] of Object.entries(result.domains)) {
-            if (!merged[rootDomain]) {
-                merged[rootDomain] = {
-                    isChina: info.isChina,
-                    ips: new Set(info.ips || []),
-                    subdomains: new Set(info.subdomains || []),
-                    sources: new Set()
-                };
-            } else {
-                (info.ips || []).forEach(ip => merged[rootDomain].ips.add(ip));
-                (info.subdomains || []).forEach(s => merged[rootDomain].subdomains.add(s));
-                if (!info.isChina) merged[rootDomain].isChina = false;
-            }
-            merged[rootDomain].sources.add(sourceHost);
-        }
-    }
-
-    // 筛选栏
     const filterBar = document.createElement('div');
     filterBar.className = 'filter-bar';
 
+    const values = Object.values(merged);
     const filters = [
-        { key: 'all', label: `全部 (${Object.keys(merged).length})` },
-        { key: 'foreign', label: `非中国 (${Object.values(merged).filter(v => !v.isChina).length})` },
-        { key: 'china', label: `中国 (${Object.values(merged).filter(v => v.isChina).length})` }
+        { key: 'all', label: `All (${values.length})` },
+        { key: 'foreign', label: `Non-CN (${values.filter((value) => !value.isChina).length})` },
+        { key: 'china', label: `CN (${values.filter((value) => value.isChina).length})` }
     ];
 
-    for (const f of filters) {
+    for (const filter of filters) {
         const btn = document.createElement('button');
-        btn.className = `filter-btn ${f.key === currentFilter ? 'active' : ''}`;
-        btn.textContent = f.label;
+        btn.className = `filter-btn ${filter.key === currentFilter ? 'active' : ''}`;
+        btn.textContent = filter.label;
         btn.addEventListener('click', () => {
-            currentFilter = f.key;
+            currentFilter = filter.key;
             renderMergedResults();
         });
         filterBar.appendChild(btn);
     }
     elMergedResults.appendChild(filterBar);
 
-    // 域名列表
     const entries = Object.entries(merged)
-        .filter(([, v]) => {
-            if (currentFilter === 'foreign') return !v.isChina;
-            if (currentFilter === 'china') return v.isChina;
+        .filter(([, value]) => {
+            if (currentFilter === 'foreign') return !value.isChina;
+            if (currentFilter === 'china') return value.isChina;
             return true;
         })
         .sort((a, b) => {
@@ -442,12 +245,10 @@ function renderMergedResults() {
         });
 
     if (entries.length === 0) {
-        elMergedResults.innerHTML += `
-      <div class="empty-state">
-        <div class="empty-icon">✨</div>
-        <p>没有匹配的域名</p>
-      </div>
-    `;
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.innerHTML = '<div class="empty-icon">-</div><p>No domains match the current filter</p>';
+        elMergedResults.appendChild(empty);
         return;
     }
 
@@ -460,7 +261,6 @@ function renderMergedResults() {
             subdomains: [...info.subdomains]
         }));
 
-        // 来源标签
         if (info.sources.size > 0) {
             const sourceTags = document.createElement('div');
             sourceTags.className = 'source-tags';
@@ -477,139 +277,54 @@ function renderMergedResults() {
     elMergedResults.appendChild(listContainer);
 }
 
-// ============================================================
-// 统计更新
-// ============================================================
-
-function updateStats() {
-    const merged = {};
-    for (const result of Object.values(allResults)) {
-        for (const [rootDomain, info] of Object.entries(result.domains)) {
-            if (!merged[rootDomain]) {
-                merged[rootDomain] = { isChina: info.isChina };
-            } else if (!info.isChina) {
-                merged[rootDomain].isChina = false;
-            }
-        }
-    }
-
-    const nonChina = Object.values(merged).filter(v => !v.isChina).length;
-    const china = Object.values(merged).filter(v => v.isChina).length;
-
-    elStatNonChina.textContent = nonChina;
-    elStatChina.textContent = china;
-}
-
-// ============================================================
-// 复制功能
-// ============================================================
-
-elBtnCopyNonChina.addEventListener('click', () => {
-    const domains = collectDomains(false);
-    copyToClipboard(domains);
-});
-
-elBtnCopyAll.addEventListener('click', () => {
-    const domains = collectDomains(null);
-    copyToClipboard(domains);
-});
-
-function collectDomains(chinaFilter) {
-    const merged = {};
-    for (const result of Object.values(allResults)) {
-        for (const [rootDomain, info] of Object.entries(result.domains)) {
-            if (!merged[rootDomain]) {
-                merged[rootDomain] = { isChina: info.isChina };
-            } else if (!info.isChina) {
-                merged[rootDomain].isChina = false;
-            }
-        }
-    }
-
-    return Object.entries(merged)
-        .filter(([, v]) => chinaFilter === null || v.isChina === chinaFilter)
-        .map(([domain]) => `*.${domain}`)
-        .sort()
-        .join('\n');
-}
-
-async function copyToClipboard(text) {
-    if (!text) {
-        showToast('❌ 没有可复制的域名');
-        return;
-    }
-
-    try {
-        await navigator.clipboard.writeText(text);
-        showToast(`✅ 已复制 ${text.split('\n').length} 个域名`);
-    } catch {
-        // 降级方案
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast(`✅ 已复制 ${text.split('\n').length} 个域名`);
-    }
-}
-
-function showToast(msg) {
-    elToast.textContent = msg;
-    elToast.classList.add('show');
-    setTimeout(() => elToast.classList.remove('show'), 2000);
-}
-
-// ============================================================
-// 工具函数
-// ============================================================
-
-function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
-
-// ============================================================
-// 历史记录
-// ============================================================
-
-const MAX_HISTORY = 50;
-
 async function loadHistory() {
     const data = await chrome.storage.local.get('domainHistory');
     return data.domainHistory || [];
+}
+
+function buildDomainsSignature(domains) {
+    const normalized = Object.entries(domains || {})
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([domain, info]) => {
+            const normalizedInfo = normalizeDomainInfo(info);
+            return [
+                domain,
+                normalizedInfo.isChina,
+                [...normalizedInfo.ips].sort(),
+                [...normalizedInfo.subdomains].sort()
+            ];
+        });
+
+    return JSON.stringify(normalized);
 }
 
 async function saveToHistory(url, domains) {
     if (!domains || Object.keys(domains).length === 0) return;
 
     const history = await loadHistory();
-
     const entries = Object.entries(domains);
-    const nonChinaCount = entries.filter(([, v]) => !v.isChina).length;
-    const chinaCount = entries.filter(([, v]) => v.isChina).length;
+    const recordSignature = buildDomainsSignature(domains);
 
     const record = {
-        id: 'hist_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-        url: url,
+        id: `hist_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        url,
         timestamp: Date.now(),
-        domains: domains,
-        nonChinaCount: nonChinaCount,
-        chinaCount: chinaCount
+        domains,
+        nonChinaCount: entries.filter(([, value]) => value.isChina === false).length,
+        chinaCount: entries.filter(([, value]) => value.isChina !== false).length,
+        signature: recordSignature
     };
 
-    // 检查是否已有相同 URL 的记录（更新而非重复插入）
-    const existingIndex = history.findIndex(h => h.url === url);
+    const existingIndex = history.findIndex((item) => item.url === url);
     if (existingIndex >= 0) {
+        if (history[existingIndex].signature === recordSignature) {
+            return;
+        }
         history[existingIndex] = record;
     } else {
         history.unshift(record);
     }
 
-    // 限制最大条目数
     while (history.length > MAX_HISTORY) {
         history.pop();
     }
@@ -619,8 +334,7 @@ async function saveToHistory(url, domains) {
 
 async function deleteHistoryItem(id) {
     const history = await loadHistory();
-    const filtered = history.filter(h => h.id !== id);
-    await chrome.storage.local.set({ domainHistory: filtered });
+    await chrome.storage.local.set({ domainHistory: history.filter((item) => item.id !== id) });
     renderHistory();
 }
 
@@ -632,14 +346,15 @@ async function clearAllHistory() {
 async function renderHistory() {
     const history = await loadHistory();
     elHistoryResults.innerHTML = '';
-    elHistoryCount.textContent = `${history.length} 条记录`;
+    elHistoryCount.textContent = `${history.length} item(s)`;
 
     if (history.length === 0) {
         elHistoryResults.innerHTML = `
-        <div class="empty-state">
-          <div class="empty-icon">📜</div>
-          <p>暂无历史记录</p>
-        </div>`;
+          <div class="empty-state">
+            <div class="empty-icon">-</div>
+            <p>No history yet</p>
+          </div>
+        `;
         return;
     }
 
@@ -648,28 +363,31 @@ async function renderHistory() {
         item.className = 'history-item';
 
         let hostname = '';
-        try { hostname = new URL(record.url).hostname; } catch { hostname = record.url; }
+        try {
+            hostname = new URL(record.url).hostname;
+        } catch {
+            hostname = record.url;
+        }
 
         const date = new Date(record.timestamp);
         const timeStr = `${date.getMonth() + 1}/${date.getDate()} ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
-        const totalDomains = record.nonChinaCount + record.chinaCount;
+        const totalDomains = (record.nonChinaCount || 0) + (record.chinaCount || 0);
 
         item.innerHTML = `
-        <div class="history-item-header">
-          <span class="history-url" title="${escapeHtml(record.url)}">📍 ${escapeHtml(hostname)}</span>
-          <button class="history-delete" data-id="${record.id}" title="删除">✕</button>
-        </div>
-        <div class="history-item-meta">
-          <span class="history-time">🕐 ${timeStr}</span>
-          <span class="history-stats">${totalDomains} 域名 · <span class="text-red">${record.nonChinaCount} 非中国</span> · <span class="text-green">${record.chinaCount} 中国</span></span>
-        </div>`;
+          <div class="history-item-header">
+            <span class="history-url" title="${escapeHtml(record.url)}">${escapeHtml(hostname)}</span>
+            <button class="history-delete" data-id="${record.id}" title="Delete">Delete</button>
+          </div>
+          <div class="history-item-meta">
+            <span class="history-time">${timeStr}</span>
+            <span class="history-stats">${totalDomains} domains / ${record.nonChinaCount || 0} non-CN / ${record.chinaCount || 0} CN</span>
+          </div>
+        `;
 
-        // 点击展开详情
         const headerEl = item.querySelector('.history-item-header');
         headerEl.addEventListener('click', (e) => {
             if (e.target.classList.contains('history-delete')) return;
 
-            // 切换详情展示
             let detail = item.querySelector('.history-detail');
             if (detail) {
                 detail.remove();
@@ -679,7 +397,7 @@ async function renderHistory() {
             detail = document.createElement('div');
             detail.className = 'history-detail';
 
-            const sorted = Object.entries(record.domains).sort((a, b) => {
+            const sorted = Object.entries(record.domains || {}).sort((a, b) => {
                 if (a[1].isChina === b[1].isChina) return a[0].localeCompare(b[0]);
                 return a[1].isChina ? 1 : -1;
             });
@@ -688,26 +406,23 @@ async function renderHistory() {
                 detail.appendChild(createDomainItem(rootDomain, info));
             }
 
-            // “加载到合并结果”按钮
             const loadBtn = document.createElement('button');
             loadBtn.className = 'btn-load-history';
-            loadBtn.textContent = '📋 加载到合并结果';
+            loadBtn.textContent = 'Load into merged results';
             loadBtn.addEventListener('click', () => {
                 allResults[record.id] = {
                     source: record.url,
                     domains: record.domains
                 };
                 updateStats();
-                showToast('✅ 已加载到合并结果');
+                showToast('History loaded');
             });
             detail.appendChild(loadBtn);
 
             item.appendChild(detail);
         });
 
-        // 删除按钮
-        const deleteBtn = item.querySelector('.history-delete');
-        deleteBtn.addEventListener('click', (e) => {
+        item.querySelector('.history-delete').addEventListener('click', (e) => {
             e.stopPropagation();
             deleteHistoryItem(record.id);
         });
@@ -716,15 +431,249 @@ async function renderHistory() {
     }
 }
 
-// 清空历史按钮
+function createLoadingElement(url) {
+    const el = document.createElement('div');
+    el.className = 'task-loading';
+    el._taskId = null;
+    el.innerHTML = `
+      <div class="task-loading-top">
+        <div class="spinner"></div>
+        <span class="task-url">${escapeHtml(url)}</span>
+        <span class="task-countdown">30s</span>
+        <button class="task-skip" title="Skip this URL">Skip</button>
+      </div>
+      <div class="task-progress-bar">
+        <div class="task-progress-fill"></div>
+      </div>
+    `;
+
+    let remaining = 30;
+    const countdownEl = el.querySelector('.task-countdown');
+    const progressFill = el.querySelector('.task-progress-fill');
+    const countdownInterval = setInterval(() => {
+        remaining--;
+        if (remaining <= 0) {
+            countdownEl.textContent = 'Finishing';
+            clearInterval(countdownInterval);
+        } else {
+            countdownEl.textContent = `${remaining}s`;
+        }
+        progressFill.style.width = `${((30 - remaining) / 30) * 100}%`;
+    }, 1000);
+    el._countdownInterval = countdownInterval;
+
+    el.querySelector('.task-skip').addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (el._taskId) {
+            chrome.runtime.sendMessage({ type: 'cancelTask', taskId: el._taskId });
+        }
+    });
+
+    return el;
+}
+
+function setAnalyzeButtonLoading(isLoading) {
+    elBtnAnalyze.disabled = isLoading;
+    elBtnAnalyze.querySelector('.btn-text').style.display = isLoading ? 'none' : 'inline';
+    elBtnAnalyze.querySelector('.btn-loading').style.display = isLoading ? 'inline' : 'none';
+}
+
+function finishManualTask(taskId, url, loadingEl, domains) {
+    if (completedManualTasks.has(taskId)) {
+        return;
+    }
+    completedManualTasks.add(taskId);
+
+    if (loadingEl._countdownInterval) {
+        clearInterval(loadingEl._countdownInterval);
+    }
+    loadingEl.remove();
+
+    allResults[taskId] = {
+        source: url,
+        domains: domains || {}
+    };
+
+    renderSiteGroup(elManualResults, url, domains || {});
+    saveToHistory(url, domains || {});
+    updateStats();
+
+    runningTasks = Math.max(0, runningTasks - 1);
+    runNextQueuedAnalysis();
+
+    const allDone = manualTaskIds.every((task) => allResults[task.taskId] !== undefined);
+    if (allDone && pendingQueue.length === 0 && runningTasks === 0) {
+        setAnalyzeButtonLoading(false);
+    }
+}
+
+function pollTask(taskId, url, loadingEl) {
+    let pollCount = 0;
+
+    const poll = () => {
+        pollCount++;
+        if (pollCount > MAX_POLLS) {
+            finishManualTask(taskId, url, loadingEl, {});
+            return;
+        }
+
+        chrome.runtime.sendMessage({ type: 'getTaskStatus', taskId }, (response) => {
+            if (chrome.runtime.lastError || !response || response.status === 'not_found') {
+                finishManualTask(taskId, url, loadingEl, {});
+                return;
+            }
+
+            if (response.status === 'done' || response.status === 'timeout' || response.status === 'cancelled' || response.status === 'interrupted') {
+                finishManualTask(taskId, url, loadingEl, response.domains || {});
+                return;
+            }
+
+            setTimeout(poll, 1000);
+        });
+    };
+
+    setTimeout(poll, 2000);
+}
+
+function runNextQueuedAnalysis() {
+    while (runningTasks < MAX_CONCURRENT_ANALYSIS && pendingQueue.length > 0) {
+        const { url, loadingEl } = pendingQueue.shift();
+        runningTasks++;
+
+        chrome.runtime.sendMessage({ type: 'analyzeUrl', url, waitTime: 6000 }, (response) => {
+            if (chrome.runtime.lastError || !response?.taskId) {
+                finishManualTask(`failed_${Date.now()}`, url, loadingEl, {});
+                return;
+            }
+
+            manualTaskIds.push({ taskId: response.taskId, url, loadingEl });
+            loadingEl._taskId = response.taskId;
+            pollTask(response.taskId, url, loadingEl);
+        });
+    }
+}
+
+function parseInputUrls(input) {
+    return input
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => {
+            if (/^https?:\/\//i.test(line)) return true;
+            if (line.includes('.') && !line.includes(' ') && !/^\d+[/-]/.test(line)) return true;
+            return false;
+        })
+        .map((line) => (/^https?:\/\//i.test(line) ? line : `https://${line}`));
+}
+
+async function init() {
+    const manifest = chrome.runtime.getManifest();
+    $('#headerVersion').textContent = `v${manifest.version}`;
+
+    try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab) {
+            elCurrentUrl.textContent = 'No active tab found';
+            return;
+        }
+
+        elCurrentUrl.textContent = tab.url || 'Cannot read current URL';
+
+        chrome.runtime.sendMessage({ type: 'getTabData', tabId: tab.id }, (response) => {
+            if (chrome.runtime.lastError || !response || Object.keys(response.domains || {}).length === 0) {
+                elCurrentResults.innerHTML = `
+                  <div class="empty-state">
+                    <div class="empty-icon">-</div>
+                    <p>尚未记录到数据。如需探测，请先开启\"全局流量探测\"开关，然后刷新页面。</p>
+                  </div>
+                `;
+                return;
+            }
+
+            allResults.__current__ = {
+                source: tab.url,
+                domains: response.domains
+            };
+            renderSiteGroup(elCurrentResults, tab.url, response.domains);
+            updateStats();
+            saveToHistory(tab.url, response.domains);
+        });
+        chrome.runtime.sendMessage({ type: 'getDetectionState' }, (response) => {
+            if (!chrome.runtime.lastError && response) {
+                elDetectionToggle.checked = response.enabled;
+            }
+        });
+    } catch (error) {
+        elCurrentUrl.textContent = `Error: ${error.message}`;
+    }
+}
+
+elDetectionToggle.addEventListener('change', (e) => {
+    const isEnabled = e.target.checked;
+    chrome.runtime.sendMessage({ type: 'setDetectionState', enabled: isEnabled }, () => {
+        if (isEnabled) {
+            showToast('已开启全局探测，请刷新页面');
+        } else {
+            showToast('已关闭全局探测');
+        }
+    });
+});
+
+$$('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+        $$('.tab').forEach((item) => item.classList.remove('active'));
+        tab.classList.add('active');
+        activeTab = tab.dataset.tab;
+
+        $$('.panel').forEach((panel) => panel.classList.remove('active'));
+        $(`#panel-${activeTab}`).classList.add('active');
+
+        if (activeTab === 'merged') {
+            renderMergedResults();
+        } else if (activeTab === 'history') {
+            renderHistory();
+        }
+    });
+});
+
+elBtnAnalyze.addEventListener('click', () => {
+    const input = elUrlInput.value.trim();
+    if (!input) return;
+
+    const urls = parseInputUrls(input);
+    if (urls.length === 0) {
+        showToast('No valid URLs found');
+        return;
+    }
+
+    setAnalyzeButtonLoading(true);
+    elManualResults.innerHTML = '';
+    manualTaskIds = [];
+    pendingQueue = [];
+    runningTasks = 0;
+    completedManualTasks.clear();
+
+    for (const url of urls) {
+        const loadingEl = createLoadingElement(url);
+        elManualResults.appendChild(loadingEl);
+        pendingQueue.push({ url, loadingEl });
+    }
+
+    runNextQueuedAnalysis();
+});
+
+elBtnCopyNonChina.addEventListener('click', () => {
+    copyToClipboard(collectDomains(false));
+});
+
+elBtnCopyAll.addEventListener('click', () => {
+    copyToClipboard(collectDomains(null));
+});
+
 elBtnClearHistory.addEventListener('click', () => {
-    if (confirm('确定要清空所有历史记录吗？')) {
+    if (confirm('Clear all history?')) {
         clearAllHistory();
     }
 });
-
-// ============================================================
-// 启动
-// ============================================================
 
 init();
